@@ -1,0 +1,923 @@
+#!/usr/bin/env python3
+#
+# Copyright (C) 2012-2013 Biao Li (biaol@bcm.edu) and Gao Wang (gaow@bcm.edu)
+# License: GNU General Public License (http://www.gnu.org/licenses/)
+
+import argparse, sys, os, re, copy, shlex, subprocess, time
+from pheno_man.pheno_man import PhenData, input2dict, rsummary, rhist, freq, mfilter, tconvert, recode_categorical, CombinedDummyCoder, qnorm, calMean, calStd, addResiduals
+#from pheno_man.pheno_man import DATA_DIR
+
+DEBUG = False
+
+# define argument parsers
+def showArguments(parser):
+    parser.add_argument('object',
+                        type=str,
+                        choices = ['data', 'fields', 'summary', 'model'],
+                        help='''Specify what to show.''')
+    parser.add_argument('--y',
+                        type=str,
+                        help='''The main phenotype name (usable for 'show summary' and 'show model').''')
+    parser.add_argument('--covariates',
+                        type=str,
+                        nargs='+',
+                        help='''Covariates names (usable for 'show summary' and 'show model'). ''')
+    parser.add_argument('--add_residuals',
+                        action='store_true',
+                        default=False,
+                        help='''Calculate residuals between model prediction and data, and add a column 'phenotype_residuals' to the data set.
+                        ''')
+    parser.add_argument('--direction',
+                        type=str,
+                        choices = ['both', 'forward', 'backward'],
+                        default = 'both',
+                        help = '''Specify the mode of stepwise search for model selection, can be one of "both", "backward", or "forward", with default of "both".
+                        '''
+                        )
+    parser.add_argument('--savedata',
+                        metavar = 'FILE',
+                        default = "savedDataset.txt",
+                        type = str, 
+                        help = '''Specify output data file name to save intermediate dataset with selected individuals.
+                        ''')
+    parser.add_argument('-r', '--reference_group',
+                        type=str,
+                        help='''Manually set reference group for dummy coded covariates,
+                        e.g. "-r TACO=EOMI_Cohort" (usable for 'show model'). ''')
+
+def viewArguments(parser):
+    parser.add_argument('-o', '--output',
+                        metavar = 'FILE',
+                        type = str,
+                        help='''Specify output graph filename.
+                        Output is in png format.''')
+    parser.add_argument('--pdf',
+                        action='store_true',
+                        default = '',
+                        help='''generate pdf instead of default png format''')
+    parser.add_argument('--savedata',
+                        metavar = 'FILE',
+                        #default = "savedDataset.txt",
+                        type = str,
+                        help = '''Specify output data file name to save an intermediate dataset.''')
+    parser.add_argument('--keepmissing',
+                        action='store_true',
+                        default = '',
+                        help = '''Keep instead of removing all missing values''')
+    
+    
+def cookArguments(parser):
+    megrp = parser.add_mutually_exclusive_group()
+    megrp.add_argument('--include',
+                        metavar = 'covariates',
+                        nargs = '+',
+                        help='''Specify the particular covariates to output.
+                        Use 'phenoman show fields' to view avaiable covariate fields.
+                        Default set to all covariates.''')
+    megrp.add_argument('--exclude',
+                        metavar = 'covariates',
+                        nargs = '+',
+                        help='''Specify the particular covariates NOT to output.
+                        Use 'phenoman show fields' to view avaiable covariate fields.
+                        Default set to exclude no covariates.''')
+    parser.add_argument('-d', '--filter_missing',
+                        metavar = 'criteria',
+                        type = mfilter,
+                        default = -1,
+                        help = '''criteria for discarding selected covariants (threshold of maximum allowed proportion of missingness for selected covariates, e.g. "--filter_missing 0.8). Specify it as -1 (default) to deactivate filling missingness''')
+    parser.add_argument('--duplicates',
+                        metavar = 'samples',
+                        nargs = '+',
+                        default = [],
+                        help = '''File names of lists of duplicates and/or related individuals
+                        ''')
+    parser.add_argument('--output',
+                        metavar = 'FILE',
+                        type = str,
+                        help='''Specify output phenotype filename''')
+
+def comdummyArguments(parser):
+    parser.add_argument('--sample_col',
+                        metavar='col_id',
+                        type=int,
+                        action='store',
+                        default = 1,
+                        help='''column index for sample names (default set to 1)''')
+    parser.add_argument('--cols',
+                        metavar = 'col_id',
+                        nargs = '+',
+                        help='''columns indexes for covariates to be combined and dummy coded''')
+    parser.add_argument('--order_by',
+                        metavar='col_id',
+                        type=int,
+                        action='store',
+                        default = 0,
+                        help='''order the input by one column before combine & dummy code it.
+                        Combined use of this and --style triangle option will make the resulting
+                        regression coefficient easier to interpret for the ESP analysis purpose''')
+    parser.add_argument('-m', '--merger_rule',
+                        metavar='expression',
+                        type=str,
+                        nargs='+',
+                        help='''rule for merging combined dummy coding groups,
+                        e.g., --merger_rule "?? = (?? + ??, ?? + ??, ...)"
+                        ''')
+    parser.add_argument('--style',
+                        type=str,
+                        choices=['diagnal', 'triangle'],
+                        default = 'diagnal',
+                        help='''dummy coding in a diagnal matrix style (like in R) or a triangle matrix
+                        style.''')
+    parser.add_argument('--header',
+                        type=str,
+                        default='CD',
+                        help='''output column name. Default is set to "CD" (for Combined Dummies)''')
+    parser.add_argument('-r', '--use_r',
+                        action='store_true',
+                        default = '',
+                        help='''call R to do the conversion, in case you do not trust my coding :)''')
+    parser.add_argument('--as_letter',
+                        action='store_true',
+                        help='''output combined groups as character letters rather than raw name strings''')
+    parser.add_argument('-v', '--verbose',
+                        action='store_true',
+                        default = '',
+                        help='''more screen output of summary information''')
+
+def commonArguments(parser):
+    parser.add_argument('-s', '--samples',
+                        metavar = 'FILE',
+                        type = str,
+                        default = None,
+                        help='''input data file (--samples /path/to/dataset.txt).
+                        Will use the entire dataset''')
+
+def filteringArguments(parser):
+    parser.add_argument('phenotype',
+                        type=str,
+                        help='''Phenotype to be processed.
+                        Use 'phenoman show fields' to view avaiable phenotypes.''')
+    outliers = parser.add_argument_group('transform phenotype and filter outliers')
+    outliers.add_argument('-t', '--transform',
+                        type=str,
+                        choices = ['log', 'log10'],
+                        help='''Log transformation of phenotype.
+                        Choose between log and log10''')
+    outliers.add_argument('-c', '--critical_values',
+                        type=float,
+                        nargs=2,
+                        metavar ='C',
+                        help='''Specify the lower (the first input value) and
+                        upper (the second input value) bounds that define extreme phenotypes.
+                        If '--percentile' argument is specified then the input upper and lower
+                        bound values are taken as percentiles (e.g., '0.01 0.99' means to include
+                        phenotypes having values within 1st and 99th percentiles)
+                        ''')
+    outliers.add_argument('-p', '--percentile',
+                        action='store_true',
+                        help='''Treat input lower and upper bounds as percentile values.
+                        ''')
+    outliers.add_argument('--scale',
+                          action='store_true',
+                          default = False,
+                          help = '''Shift phenotype values by mean (x-mean)
+                          ''')
+    outliers.add_argument('--standardize',
+                          action='store_true',
+                          default=False,
+                          help='''Standardize phenotype values by (x-mean)/variance
+                          ''')
+    outliers.add_argument('--normalize',
+                          action='store_true',
+                          default=False,
+                          help='''Apply normalization on phenotype, which scales all numeric values in the range [0,1] by (x-min)/(max-min)'
+                          ''')
+    outliers.add_argument('--qnormalize',
+                          type=float,
+                          nargs=2,
+                          metavar = 'probability',
+                          help='''Apply the Gaussian Quantile normalization on phenotype between the specified lower and upper bounds that define the range of probabilities, e.g. 0.025 0.975'
+                          ''')
+    
+def selectArguments(parser):
+    parser.add_argument('--traits',
+                        metavar = 'phenotypes',
+                        nargs = '+',
+                        default = [],
+                        help='''Specify particular traits.
+                        ''')
+    parser.add_argument('--criteria',
+                        metavar = 'criteria',
+                        nargs = '+',
+                        default = [],
+                        help='''Specify selection criteria for traits. Only individuals that have specified traits following given criteria will be selected. Each criterion for each trait can be a single value/string(0 or NA), a range of numerical values (e.g. "20, 80" including boundary values) or a list of strings (separated by '|') to choose from (e.g. A|B|C)''')
+    parser.add_argument('--savedata',
+                        metavar = 'FILE',
+                        type = str,
+                        default = "selectedDataset.txt", 
+                        help = '''Specify output data file name to save intermediate dataset with selected individuals.
+                        ''')
+    parser.add_argument('--removeselected',
+                        action='store_true',
+                        default = False,
+                        help = '''Remove selected individuals from the dataset instead of keeping them 
+                        ''')
+    parser.add_argument('--samplesize',
+                        metavar='samplesize',
+                        type=int,
+                        action='store',
+                        default = 0,
+                        help = '''Desired number of individuals remained in the dataset after selection criteria have been applied 
+                        '''
+                        )
+    #parser.add_argument('--namelists',
+    #                    metavar = 'FILES',
+    #                    nargs = '+',
+    #                    default = [],
+    #                    help = '''Files that contain lists of sample names
+    #                    ''')
+    parser.add_argument('--removethese',
+                        metavar = 'FILES',
+                        nargs = '+',
+                        default = [],
+                        help = '''Files that contain lists of sample names to be removed from the dataset under any circumstance.
+                        ''')
+    parser.add_argument('--keepthese',
+                        metavar = 'FILES',
+                        nargs = '+',
+                        default = [],
+                        help = '''Files that contain lists of sample names to be kept in the dataset regardless of --criteria.
+                        ''')
+    parser.add_argument('--tobecases',
+                        action='store_true',
+                        default=False,
+                        help = '''Set phenotype/trait1 (--traits trait1 trait2 ...) in remained individuals to 1 (1 for case). 
+                        ''')
+    parser.add_argument('--tobecontrols',
+                        action='store_true',
+                        default=False,
+                        help = '''Set phenotype/trait1 (--traits trait1 trait2 ...) in remained individuals to 0 (0 for control).
+                        ''')
+    parser.add_argument('--keeporiginal',
+                        action='store_true',
+                        default=False,
+                        help = '''Keep original values of trait1 by adding a new column named by 'trait1_original' to the dataset.
+                        ''')
+    parser.add_argument('--bynames',
+                        metavar = 'FILES',
+                        nargs = '+',
+                        default = [],
+                        help = '''Files that contain lists of sample names to be selected.
+                        ''')
+ 
+
+def mergeArguments(parser):
+    parser.add_argument('--byrows',
+                        metavar = 'FILES',
+                        nargs = '+',
+                        help = '''File names of datasets to be merged by rows (merge all individuals in given files into a single file).
+                        ''')
+    parser.add_argument('--bycolumns',
+                        metavar = 'FILES',
+                        nargs = '+',
+                        help = '''File names of datasets to be merged by columns, where file #1 is the primary file into which other files will be merged (add columns that are contained in files #2, #3, ..., but not in file #1 to file #1; missing values in newly added columns will be marked by 'nan')
+                        ''')
+    parser.add_argument('--output',
+                        metavar = 'FILE',
+                        type = str,
+                        help = '''Specify output data file name to save the merged dataset.
+                        ''')
+
+
+def massageArguments(parser):
+    parser.add_argument('--lower',
+                        type = float,
+                        action = 'store',
+                        metavar = 'lower bound',
+                        default = None,
+                        help = '''Specify lower bound (e.g. 0 or 0.001 if --percentile)
+                        ''')
+    parser.add_argument('--upper',
+                        type = float,
+                        action = 'store',
+                        metavar = 'upper bound',
+                        default = None,
+                        help = '''Specify upper bound (e.g 400 or 0.999 ir --percentile)
+                        ''')
+    parser.add_argument('--savedata',
+                        metavar = 'FILE',
+                        type = str,
+                        required = True,
+                        help = '''Specify output data file name to save intermediate dataset.
+                        ''')
+
+
+#def removeArguments(parser):
+#    parser.add_argument('--namelists'
+#                        )
+
+
+def reportArguments(parser):
+    parser.add_argument('-y', '--year',
+                        type = str,
+                        help = '''Specify which year, an integer, e.g. 13, or year range, e.g. 13-14''')
+    parser.add_argument('-m', '--month',
+                        type = str,
+                        help = '''Specify which month or range of months, e.g. 10 or 6-8''')
+    parser.add_argument('-d', '--day',
+                        type = str,
+                        help = '''Specify which day or days, e.g. 15, or 10-20''')
+    parser.add_argument('-o', '--hour',
+                        type = str,
+                        help = '''Specify which hour or hours, e.g. 14, or 10-16''')
+    parser.add_argument('-s', '--samples',
+                        metavar = 'FILE',
+                        type = str,
+                        help = '''Specify which data set, e.g. AA.txt''')
+    parser.add_argument('-f', '--filename',
+                        metavar = 'FILE',
+                        type = str,
+                        help = '''Specify output file name that queried commands will be saved to, e.g. phenoman_report.txt''')
+
+
+
+def _infileFunc(samples):
+    '''
+    check if args.samples exists
+    '''
+    #if samples in ["EA", "AA", "ALL"]:
+    #    return os.path.join(DATA_DIR, samples+'.txt')
+    #else:
+    #    return samples
+    if args.samples is None:
+        raise ValueError("Need to specify input data set '--samples'")
+    return samples
+
+
+def getkey(d, value):
+    for k, i in d.items():
+        if i == value:
+            return k
+
+class R_parser():
+    '''
+    Parse model selection std-output from R rsummary func
+    '''
+    def __init__(self, summary):
+        '''
+        summary - R stdout string from func rsummary in pheno_man.py
+        '''
+        self.summary = summary.split('\n') 
+        return
+
+    def _parsems(self, colname = None, mapping = None):
+        '''parse the result from model selection to print out model selection result'''
+        summary = self.summary
+        bp = summary.index('INPUT MODEL:')
+        # format output coefs
+        coefs =[list(map(tconvert, x.strip().split(','))) for x in summary[bp:] if x]
+        coefs_str = ''
+        for x in coefs:
+            # a regular row (x) should have 5 columns: name, beta, se, statistic, pvalue
+            if x[0] == 'residuals:':
+                break
+            #
+            if 'Estimate' in x: x.insert(0, 'Predictor')
+            for idx, i in enumerate(x):
+                # skip se
+                if idx == 2:
+                    continue
+                if idx == 0 and colname and mapping and i.startswith(colname):
+                    i = i[:-1] + getkey(mapping, i[-1])
+                    i = re.sub(colname, 'D:', i)
+                j = '{:.2E}'.format(i).replace('E+00', '') if isinstance(i, float) else str(i)
+                if idx > 0:
+                    coefs_str += '{:<10}'.format(j)
+                else:
+                    coefs_str += '{:<50}'.format(j)
+                coefs_str += '\t'
+            if len(x) < 4:
+                coefs_str += '\n'
+            coefs_str += '\n'
+        output = coefs_str
+        # format output model selections
+        output += "\nMODEL SELECTION:\n"
+        aic = []
+        null = 0
+        for x in summary[:bp]:
+            if x and not null % 2:
+                aic.append(x.strip())
+            if not x:
+                null += 1
+        aic_str = ''
+        for x in aic:
+            if ":" in x:
+                aic_str += '\n' + x.split(":")[-1].strip() + '\t'
+            else:
+                aic_str += x
+        output += aic_str.replace(' ', '').replace('y~', '') + '\n'
+        #
+        return output
+    
+    def _parseResid(self):
+        '''
+        parse the result to extract residuals into a list of values
+        '''
+        index = self.summary.index("residuals:")
+        # format output residuals
+        residList = [list(map(tconvert, x.strip().split(','))) for x in self.summary[index:] if x]
+        resids = [i[-1] for i in residList if len(i)==2]
+        return resids
+
+
+# define subcommands
+def show(args):
+    ## The following lines are for the Test purpose 
+    #infile = _infileFunc(args.samples)
+    #d = PhenData(infile)
+    #dups = d.findDuplicates(args.duplicates)
+    #sys.exit(0)
+    ##
+    '''please refer to phenoman -h'''
+    infile = _infileFunc(args.samples)
+    if args.object == 'data':
+        # print raw data to screen
+        os.system('cat {}'.format(infile))
+    elif args.object == 'fields':
+        # print fields statistics to screen
+        d = PhenData(infile)
+        print('{:<50}\t{:>15}\t{:>15}\t{:>15}'.format('Field:', 'Valid counts:', 'Invalid counts:', 'Missing ratio:'))
+        for x, y, z in zip(*d.fsummarize()):
+            print('{:<50}\t{:>15}\t{:>15}\t{:>15}'.format(x, y, z, '{0:G}'.format(float(z)/float(z+y+1E-10), precision=3)))
+    else:
+        # evaluate model properties, using data from standard input
+        # OR, print data summary to screen, using data from standard input
+        d = input2dict(sys.stdin.readlines())
+        dataset = copy.deepcopy(d)
+        colname = None
+        if args.reference_group:
+            try:
+                colname, rgname = args.reference_group.split('=')
+                colname = colname.strip()
+                rgname = rgname.strip()
+                if not colname and rgname:
+                    raise ValueError("Empty input")
+            except:
+                sys.exit('Invalid format of -r/--reference_group: "{}"'.format(args.reference_group))
+            d, mapping = recode_categorical(d, colname, refgrp = rgname)
+        else:
+            mapping = None
+        # model selection or output summary statistics or adding residuals
+        summary = rsummary(d, main = args.y, covariates = args.covariates, option = args.object, addResiduals = args.add_residuals, direction=args.direction)
+        parserInst = R_parser(summary)
+        if args.object == 'model':
+            if not args.add_residuals: # model selection
+                print(parserInst._parsems(colname, mapping))
+            else: # adding residuals (can only be applied on quantitative traits)
+                residuals = parserInst._parseResid()
+                addResiduals(dataset = dataset, field = args.y, residuals = residuals, outFileName = args.savedata)
+        else: # output summary statistics of '--y' and '--covariates'
+            print(summary)
+    return
+
+
+def clean(args, remove_outliers = False, remove_duplicates = False, remove_missingness = True):
+    '''detect and clean out main phenotype missing, duplicates and outliers'''
+    infile = _infileFunc(args.samples)
+    d = PhenData(infile)
+    # missing
+    pheno_missing = d.findMissing(args.phenotype)
+    sys.stdout.write('There are %d individuals that are missing values on phenotype %s\n\n' % (len(pheno_missing), str(args.phenotype)))
+    if remove_missingness:
+        #pheno_missing = d.findMissing(args.phenotype)
+        d.removeSamples(pheno_missing)
+        #sys.stderr.write('There are %d individuals that are missing values on phenotype %s\n\n' % (len(pheno_missing), str(args.phenotype)))
+    # data transformation
+    if args.transform == 'log':
+        d.log(args.phenotype)
+        #args.phenotype = "log_" + args.phenotype
+    if args.transform == 'log10':
+        d.log10(args.phenotype)
+        #args.phenotype = "log10_" + args.phenotype
+    ## data scaling
+    if args.scale:
+        d.scale(args.phenotype)
+    # data standardization
+    if args.standardize:
+        d.standardize(args.phenotype)
+    # data normalization (0-1)
+    if args.normalize:
+        d.normalize(args.phenotype)
+    # data normalization (Gaussian quantile)
+    if args.qnormalize:
+        d.qnormalize(args.phenotype, args.qnormalize)
+    ##
+    # outliers
+    # if args.p is True, find exact cutoff values based on input percentiles
+    outliers = d.findOutliers(args.phenotype, d.findPercentile(args.phenotype, args.critical_values) if args.percentile else args.critical_values)
+    if remove_outliers:
+        d.removeSamples(outliers)
+    # duplicates
+    try:
+        fileNameList = args.duplicates
+        dups = d.findDuplicates(fileNameList)
+        if remove_duplicates:
+            d.removeSamples(dups)
+            sys.stdout.write('There are %d individuals that are duplicates and have been removed\n\n' % len(dups))
+    except:
+        dups = []
+    #
+    return d, args, dups, outliers
+
+
+def cook(args):
+    '''please refer to phenoman -h'''
+    d, args, dups, outliers = clean(args, remove_outliers = True, remove_duplicates = True)
+    # These two basic fields must be outputted
+    fields = d.data.keys()
+    if args.include:
+        fields = args.include
+    if args.exclude:
+        fields = list(set(d.data.keys()) - set(args.exclude))
+    fields = list(set(fields) - set(['sample_name', args.phenotype]))
+    # very silly way to re-order the fields list
+    ordered_fields = []
+    for item in d.data.keys():
+        if item in fields:
+            ordered_fields.append(item)
+    # trim data by fields
+    for k in d.data.keys():
+        if k not in ['sample_name', args.phenotype] + ordered_fields:
+            del d.data[k]
+    # clean and output
+    # if filter_missing == -1 : do not fill missingness for any covariate
+    if args.filter_missing != -1:
+        stat, warn1 = d.fillMissing(verbose = True, threshold = args.filter_missing)
+    out, warn2 = d.output(ordered_fields, required = [args.phenotype])
+    # write to file
+    ofile = args.output if args.output else args.phenotype + '_cleaned.txt'
+    with open(ofile, 'w') as f:
+        f.write(out)
+    #
+    if args.filter_missing != -1:
+        if warn1 or warn2:
+            sys.stderr.write(warn1 + '\n' + warn2)
+        print(stat)
+    #else:
+        if warn2:
+            sys.stderr.write(warn2)
+    #
+    return
+
+
+def view(args):
+    '''please refer to phenoman -h'''
+    # if output intermediate dataset, need to have outliers removed
+    if args.savedata:
+        if args.keepmissing:
+            d, args, dups, outliers = clean(args, remove_outliers = True, remove_duplicates = False, remove_missingness = False)
+        else:
+            d, args, dups, outliers = clean(args, remove_outliers = True, remove_duplicates = False, remove_missingness = True)
+    else: # if only for viewing purpose
+        d, args, dups, outliers = clean(args, remove_outliers = False, remove_duplicates = False, remove_missingness = True)
+    ## output basic field info
+    #tmp = set(d.data[args.phenotype])
+    #if len(tmp) < 20:
+    #    print(list(tmp), len(list(tmp)))
+    #else:
+    #    print(list(tmp)[:20], len(list(tmp)))
+    # log transformation
+    if args.transform in ["log", "log10"]:
+        args.phenotype = args.transform + "_" + args.phenotype
+    # scaling
+    if args.scale:
+        args.phenotype = args.phenotype + "_scaled"
+    # standardization
+    if args.standardize:
+        args.phenotype = args.phenotype + "_standardized"
+    # normalization
+    if args.normalize:
+        args.phenotype = args.phenotype + "_normalized"
+    # quantile normalization
+    if args.qnormalize:
+        args.phenotype = args.phenotype + "_qnormalized"
+    ## plot file name
+    if len(args.samples.split('.')) > 1:
+        ofile = args.output if args.output else args.phenotype + '_histogram_'+args.samples.split('.')[0]
+    else:
+        ofile = args.output if args.output else args.phenotype + '_histogram_'+args.samples
+    ofile += '.pdf' if args.pdf else '.png'
+    #
+    rhist(d.data, args.phenotype, output=ofile, vlines = d.findPercentile(args.phenotype, args.critical_values) if args.percentile else args.critical_values)
+    #if not args.pdf:
+    #    try:
+    #        os.system('convert -density 150 {0}.pdf {0}.jpg'.format(re.sub('\.pdf$', '', ofile)))
+    #        os.system('rm -f %s' % ofile)
+    #    except:
+    #        sys.stderr.write('Cannot find convert command, output plot in pdf instead of jpg\n')
+    # find and print outliers
+    if outliers:
+        sys.stdout.write('OUTLIERS detected!\n')
+        for k in outliers.keys():
+            print('{:<20}\t{}'.format(k, outliers[k]))
+    # save intermediate dataset
+    if args.savedata:
+        # write to file
+        d.dumpDataset(args.savedata)
+    return
+
+def comdummy(args):
+    '''please refer to phenoman -h'''
+    cdc = CombinedDummyCoder(args, _infileFunc(args.samples))
+    output = cdc.run()
+    print(output)
+    return
+
+
+def select(args):
+    '''
+    please refer to phenoman -h
+    '''
+    infile = _infileFunc(args.samples)
+    d = PhenData(infile, recodeNullsInFile=False)
+    #
+    if args.removeselected:
+        d.select(args.traits, args.criteria, False, args.savedata, args.samplesize, args.removethese, args.keepthese, args.tobecases, args.tobecontrols, args.keeporiginal, args.bynames)
+    else:
+        d.select(args.traits, args.criteria, True, args.savedata, args.samplesize, args.removethese, args.keepthese, args.tobecases, args.tobecontrols, args.keeporiginal, args.bynames)
+        
+    #    if args.savedata:
+    #        d.select(args.traits, args.criteria, False, args.savedata, args.samplesize)
+    #    else:
+    #        d.select(args.traits, args.criteria, False, args.samplesize)
+    #else:
+    #    if args.savedata:
+    #        d.select(args.traits, args.criteria, True, args.savedata, args.samplesize)
+    #    else:
+    #        d.select(args.traits, args.criteria, True, args.samplesize)
+    return
+    
+    
+def merge(args):
+    '''
+    please refer to phenoman -h and/or func mergeArguments
+    '''
+    if args.byrows is None and args.bycolumns is None:
+        raise ValueError("Need to specify files to merge using option '--byrows' or '--bycolumns'.")
+    if args.byrows is not None and args.bycolumns is not None:
+        raise ValueError("Can only choose to merge either by row (use option '--byrows') or by column (use option '--bycolumns').")
+    #
+    if args.byrows is not None:
+        fileObjs = [open(fi, 'r') for fi in args.byrows]
+        outFile = open(args.output, 'w')
+        fileLines = [obj.readlines() for obj in fileObjs]
+        # write 1st dataset with header
+        [outFile.write(i) for i in fileLines[0] if i != '\n']
+        # append other datasets w/o header
+        for lines in fileLines[1:]:
+            [outFile.write(i) for i in lines[1:] if i != '\n']
+        # close files
+        outFile.close()
+        [fi.close() for fi in fileObjs]
+    # FIXME: add func to merge files bycolumns!!
+    elif args.bycolumns is not None:
+        pass
+    sys.stdout.write('Files merged\n')
+    return
+    
+
+def massage(args):
+    '''
+    please refer to phenoman -h and/or func massage Argument
+    '''
+    infile = _infileFunc(args.samples)
+    d = PhenData(infile)
+    #
+    field = args.phenotype
+    lower = args.lower
+    upper = args.upper
+    percentile = args.percentile
+    outFileName = args.savedata
+    #
+    if lower is None and upper is None:
+        raise ValueError("At least either a lower or upper bound should be specified")
+    d.massage(field=field, lower=lower, upper=upper, outFileName=outFileName, percentile=percentile)
+    #
+    return
+
+
+def _timeFunc(t):
+    if t is None:
+        return t
+    tmp = t.split('-')
+    if len(tmp) == 2:
+        return tmp
+    elif len(tmp) == 1:
+        return tmp * 2
+    else:
+        raise SyntaxError("Incorrect input format of --year, --month, --day or --hour")
+
+
+def report(args):
+    '''
+    please refer to phenoman report -h and/or func report arguments
+    '''
+    year, month, day, hour, dataset = _timeFunc(args.year), _timeFunc(args.month), _timeFunc(args.day), _timeFunc(args.hour), args.samples
+    # 
+    home = os.path.expanduser("~")
+    cmdFile = os.path.join(home, '.phenoman', 'commands.log')
+    if not os.path.exists(cmdFile):
+        raise OSError('Cannot find any phenoman commands in command history')
+    if not args.filename:
+        raise ValueError("Need to specify file name, --filename, to save outputs from 'phenoman report'")
+    fi = open(cmdFile, 'r')
+    lines = fi.readlines()
+    fi.close()
+    dataFileNames = [args.samples] if args.samples else []
+    cmdToSave = []
+    for idx, l in enumerate(lines):
+        if l.startswith('#') and filterByTime(l, year, month, day, hour):
+            flag, dataFileNames = filterByNames(lines[idx+1], dataFileNames)
+            if flag:
+                cmdToSave.append(lines[idx+1])
+        else:
+            continue
+    # save retrieved commands in args.filename
+    fi = open(args.filename, 'a')
+    fi.write('# %s\n' % time.strftime('%X %x %Z'))
+    fi.write('>>> phenoman report --year %s --month %s --day %s --hour %s --samples %s --filename %s\n' % (args.year, args.month, args.day, args.hour, args.samples, args.filename))
+    fi.write('---------------------------------------------------------------\n')
+    for cmd in cmdToSave:
+        fi.write('%s' % cmd)
+    fi.write('---------------------------------------------------------------\n\n\n')
+    fi.close()
+    
+    
+    
+    
+
+def filterByTime(timeMark, year, month, day, hour):
+    # 22:23:35 11/05/13 CST
+    tmp = timeMark.split(' ')
+    tmpTime, tmpDate = tmp[1], tmp[2]
+    tmpHour = tmpTime.split(':')[0]
+    tmpDate = tmpDate.split('/')
+    tmpYear, tmpMonth, tmpDay = tmpDate[2], tmpDate[0], tmpDate[1]
+    if year and not int(year[0]) <= int(tmpYear) <= int(year[1]):
+        return False
+    if month and not int(month[0]) <= int(tmpMonth) <= int(month[1]):
+        return False
+    if day and not int(day[0]) <= int(tmpDay) <= int(day[1]):
+        return False
+    if hour and not int(hour[0]) <= int(tmpHour) <= int(hour[1]):
+        return False
+    return True
+
+
+def _nameFunc(cmd):
+    tmp = cmd.split('--savedata ')
+    if len(tmp) == 2:
+        tmp[1] = tmp[1].rstrip('\n')
+        return tmp[1].split(' ')[0]
+    tmp = cmd.split('--output ')
+    if len(tmp) == 2:
+        tmp[1] = tmp[1].rstrip('\n')
+        return tmp[1].split(' ')[0]
+    return
+
+
+def filterByNames(cmd, dataFileNames):
+    if len(dataFileNames) == 0:
+        return True, []
+    flag = False
+    tmp = copy.deepcopy(dataFileNames)
+    for name in dataFileNames:
+        if name not in cmd:
+            continue
+        else:
+            flag, newName = True, _nameFunc(cmd)
+            if newName:
+                tmp.append(newName)
+    return flag, tmp
+
+
+def typeOfValue(x):
+    if x is None:
+        return 'None'
+    try:
+        x = int(x)
+        return 'int'
+    except:
+        try:
+            x = float(x)
+            return 'float'
+        except:
+            return 'str'
+       
+#def cmdStdout(cmd):
+#    p = subprocess.Popen(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+#    out, err = p.communicate()
+#    return out, err
+
+
+def saveStdinCommand(master_parser, argv):
+    '''
+    save phenoman stdin command to a local folder (hidden) 
+    '''
+    args, unknown_args = master_parser.parse_known_args()
+    args.cmd = 'phenoman ' + \
+            ' '.join([x if (typeOfValue(x) != 'str' or x.startswith('-') or " " not in x) else "'{0}'".format(x) for x in argv[1:]])
+    # check if local tmp folder for phenoman has been created
+    home = os.path.expanduser("~")
+    tmpDir = os.path.join(home, '.phenoman')
+    # create one if not existed
+    if not os.path.exists(tmpDir):
+        os.makedirs(tmpDir)
+    cmdFile = os.path.join(tmpDir, 'commands.log')
+    if not os.path.exists(cmdFile):
+        open(cmdFile, 'a').close()
+    # if DEBUG, do not save 'phenoman report' commands
+    if DEBUG and args.cmd.startswith('phenoman report'):
+        return
+    # write command and time info into commands.log
+    fi = open(cmdFile, 'a')
+    fi.write('# %s\n' % time.strftime('%X %x %Z'))
+    fi.write('%s\n' % args.cmd)
+    fi.close()
+    return
+
+ 
+
+if __name__ == '__main__':
+    master_parser = argparse.ArgumentParser(
+                    description = '''Program for phenotype data exploration, management and quality control in association studies of quantitative and qualitative traits''',
+                    prog = 'phenoman',
+                    fromfile_prefix_chars = '@',
+                    epilog = '''Biao Li and Gao Wang (c) 2012-2013. Contact: biaol@bcm.edu''')
+    master_parser.add_argument('--version', action='version', version='%(prog)s 1.0rc1')
+    subparsers = master_parser.add_subparsers()
+    # subparser 1
+    parser_show = subparsers.add_parser('show', help='''show raw data, or show data summary for data from standard input''')
+    showArguments(parser_show)
+    commonArguments(parser_show)
+    parser_show.set_defaults(func=show)
+    # subparser 2
+    parser_view = subparsers.add_parser('view', help='''for specified trait in specified population, generate histogram to
+                                    help determine transformation of trait and outliers (duplicates implicitly excluded)''')
+    commonArguments(parser_view)
+    viewArguments(parser_view)
+    filteringArguments(parser_view)
+    parser_view.set_defaults(func=view)
+    # subparser 3
+    parser_cook = subparsers.add_parser('cook', help='''for specified trait in specified population, remove missing values,
+                                    remove duplicates, remove outliers, transform trait if necessary, fill-up missing
+                                    covariates and output cleaned phenotypes and selected covariates''')
+    commonArguments(parser_cook)
+    cookArguments(parser_cook)
+    filteringArguments(parser_cook)
+    parser_cook.set_defaults(func=cook)
+    # subparser 4
+    parser_comdummy = subparsers.add_parser('comdummy', help='''combine & dummy code covariates''')
+    commonArguments(parser_comdummy)
+    comdummyArguments(parser_comdummy)
+    parser_comdummy.set_defaults(func=comdummy)
+    
+    # subparser 5 (select)
+    parser_select = subparsers.add_parser('select', help='''select individuals according to specified traits with given criteria, add individuals to or remove individuals from the dataset''')
+    commonArguments(parser_select)
+    selectArguments(parser_select)
+    parser_select.set_defaults(func=select)
+    #
+    
+    # subparser 6 (merge)
+    parser_merge = subparsers.add_parser('merge', help='''merge separated datasets into one''')
+    #commonArguments(parser_merge)
+    mergeArguments(parser_merge)
+    parser_merge.set_defaults(func=merge)
+    #
+    
+    # subparser 7 (massage)
+    parser_massage = subparsers.add_parser('massage', help = '''reset trait values that are out of specified bounds into boundary values (winsorization)''')
+    commonArguments(parser_massage)
+    massageArguments(parser_massage)
+    filteringArguments(parser_massage)
+    parser_massage.set_defaults(func=massage)
+    #
+    
+    # subparser 8 (report)
+    parser_report = subparsers.add_parser('report', help = '''generate a list of successfully executed phenoman commands that have been run between a timeframe and/or applied on a data set''')
+    reportArguments(parser_report)
+    parser_report.set_defaults(func=report)
+    
+    # getting args
+    args = master_parser.parse_args()
+    # calling the associated functions
+    if DEBUG:
+        args.func(args)
+        saveStdinCommand(master_parser, sys.argv)
+    else:
+        try:
+            args.func(args)
+            saveStdinCommand(master_parser, sys.argv)
+        except Exception as e:
+            sys.exit('An ERROR has occured: {}'.format(e))
