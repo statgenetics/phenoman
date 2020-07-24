@@ -164,7 +164,7 @@ def runR(maer):
 		warnings = None
 		if not isinstance(maer, basestring):
 			raise ValueError("Input script must be a string")
-		tc = Popen(["R", '--slave', '--vanilla'], stdin = PIPE, stdout = PIPE, stderr = PIPE)
+		tc = Popen(["R", '--subordinate', '--vanilla'], stdin = PIPE, stdout = PIPE, stderr = PIPE)
 		out, error = tc.communicate(maer.encode(sys.getdefaultencoding()))
 		if (tc.returncode):
 			raise ValueError("**** R ERROR ****\n{}*****************\n".format(error.decode(sys.getdefaultencoding())))
