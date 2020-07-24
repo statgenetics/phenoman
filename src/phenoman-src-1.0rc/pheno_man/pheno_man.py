@@ -1253,7 +1253,7 @@ class CombinedDummyCoder:
 
     def R(self, rstr):
         ''' Run R command and parse the output '''
-        tc = Popen(["R", '--slave', '--vanilla'], stdin = PIPE, stdout = PIPE, stderr = PIPE)
+        tc = Popen(["R", '--subordinate', '--vanilla'], stdin = PIPE, stdout = PIPE, stderr = PIPE)
         out, error = tc.communicate(rstr.encode(sys.getdefaultencoding()))
         if (tc.returncode):
             raise ValueError(" (exception captured from R) \n{0}".format(error.decode(sys.getdefaultencoding())))
